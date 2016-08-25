@@ -20,7 +20,7 @@
 
 
 class Connector(object):
-    """Adapter for the reading the output of modules in fixed sized increments.
+    """Adapter for reading the output of modules in fixed sized increments.
 
     A module is free to produce output in arbitrary sized blocks.  In some cases that can be inconvenient to work with,
     and it is easier if the receiver can dictate how much data it wants to receive.  A Connector acts as an adapter to

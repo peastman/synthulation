@@ -225,6 +225,8 @@ class Filter(object):
         self._input = input
         self._a = a
         self._b = b
+        self._lastInputs = np.array([])
+        self._lastOutputs = np.array([])
         self._computeZ()
 
     @property
@@ -246,7 +248,7 @@ class Filter(object):
         self._computeZ()
 
     def _computeZ(self):
-        self._z = scipy.signal.lfiltic(self._b, self._a, [], [])
+        self._z = scipy.signal.lfiltic(self._b, self._a, self._lastOutputs[::-1], self._lastInputs[::-1])
 
     def getData(self):
         """Get output data from the module.
@@ -258,6 +260,8 @@ class Filter(object):
         """
         inputData = self._input.getData()
         (filtered, self._z) = scipy.signal.lfilter(self._b, self._a, inputData, zi=self._z)
+        self._lastInputs = np.concatenate((self._lastInputs, inputData))[-len(self._b)-1:]
+        self._lastOutputs = np.concatenate((self._lastOutputs, filtered))[-len(self._a)-1:]
         return filtered
 
 
@@ -511,6 +515,186 @@ class BandstopFilter(Filter):
         self._order = value
         self._computeCoefficients()
         self._computeZ()
+
+
+class Resonator(Filter):
+    """A module that applies a resonant filter to its input.
+
+    More precisely, this is a driven, damped harmonic oscillator.  The input signal acts as the driving force.  It is
+    characterized by the frequency at which it resonates and the friction coefficient.  Small friction values produce
+    strong resonance over a narrow range of frequencies, while larger friction values produce weaker resonance over a
+    wider range of frequencies.
+
+    Attributes
+    ----------
+    frequency : float
+        the resonant frequency in Hz
+    friction : float
+        the friction coefficient in 1/seconds
+    """
+    def __init__(self, input, frequency=500.0, friction=10.0, sampleRate=44100):
+        """Construct a Resonator module
+
+        Parameters
+        ----------
+        input : module
+            the input module whose output should be filtered
+        frequency : float
+            the resonant frequency in Hz
+        friction : float
+            the friction coefficient in 1/seconds
+        sampleRate : float
+            the sample rate at which data is being generated in samples/second
+        """
+        self._frequency = frequency
+        self._friction = friction
+        self._sampleRate = sampleRate
+        self._computeCoefficients()
+        Filter.__init__(self, input, self._a, self._b)
+
+    def _computeCoefficients(self):
+        c = 2*self._friction
+        k = (4*math.pi*math.pi)*(self._frequency**2 + self._friction**2)
+        dt = 1.0/self._sampleRate
+        self._a = [1.0, -2.0+c*dt+k*dt*dt, 1.0-c*dt]
+        self._b = [1.0]
+
+    @property
+    def frequency(self):
+        return self._frequency
+
+    @frequency.setter
+    def frequency(self, value):
+        self._frequency = value
+        self._computeCoefficients()
+        self._computeZ()
+
+    @property
+    def friction(self):
+        return self._friction
+
+    @friction.setter
+    def friction(self, value):
+        self._friction = value
+        self._computeCoefficients()
+        self._computeZ()
+
+
+class Envelope(object):
+    """A module implementing an attack-hold-decay-sustain-release envelope.
+
+    The output of this module is initially 0.  When beginAttack() is called, it rises linearly to 1 over the attack
+    time; remains there for the hold time; decreases linearly over the decay time until it reaches the sustain level;
+    remains constant until beginRelease() is called; and then decreases linearly to 0.
+
+    Attributes
+    ----------
+    attack : float
+        the attack time in seconds
+    hold : float
+        the hold time in seconds
+    decay : float
+        the decay time in seconds
+    sustain : float
+        the sustain level
+    release : float
+        the release time in seconds
+    """
+    def __init__(self, attack=0.1, hold=0.1, decay=0.8, sustain=0.5, release=0.1, sampleRate=44100):
+        """Construct an Envelope module
+
+        Parameters
+        ----------
+        attack : float
+            the attack time in seconds
+        hold : float
+            the hold time in seconds
+        decay : float
+            the decay time in seconds
+        sustain : float
+            the sustain level
+        release : float
+            the release time in seconds
+        sampleRate : float
+            the sample rate at which data is being generated in samples/second
+        """
+        self.attack = attack
+        self.hold = hold
+        self.decay = decay
+        self.sustain = sustain
+        self.release = release
+        self._sampleRate = sampleRate
+        self._stage = 0
+        self._phase = 0
+        self._initialLevel = 0.0
+        self._currentLevel = 0.0
+
+    def beginAttack(self):
+        """Begin the attack stage."""
+        self._stage = 1
+        self._phase = 0
+        self._initialLevel = self._currentLevel
+
+    def beginRelease(self):
+        """Begin the release stage."""
+        self._stage = 5
+        self._phase = 0
+        self._initialLevel = self._currentLevel
+
+    def getData(self):
+        """Get output data from the module.
+
+        Returns
+        -------
+        output : NumPy array
+            an array containing the next block of output data
+        """
+        if self._stage == 0: # no note playing
+            self._currentLevel = 0.0
+            return np.zeros((512,), np.float32)
+        if self._stage == 4: # sustain
+            self._currentLevel = self.sustain
+            return self.sustain*np.ones((512,), np.float32)
+        stageTime = (0, self.attack, self.hold, self.decay, 0, self.release)[self._stage]
+        finalLevel = (0, 1, 1, self.sustain, self.sustain, 0)[self._stage]
+        blockSize = min(self._sampleRate*stageTime-self._phase, 512)
+        if blockSize == 0:
+            self._stage = (self._stage+1)%6
+            self._phase = 0
+            self._initialLevel = self._currentLevel
+            return np.zeros((0,), np.float32)
+        start = (self._phase/self._sampleRate)/stageTime
+        end = ((self._phase+blockSize)/self._sampleRate)/stageTime
+        self._phase += blockSize
+        self._currentLevel = finalLevel*end+self._initialLevel*(1-end)
+        return np.linspace(finalLevel*start+self._initialLevel*(1-start), self._currentLevel, blockSize, endpoint=False)
+
+
+class FunctionModule(object):
+    """A module that applies an arbitrary function to each element of its input."""
+
+    def __init__(self, input, function):
+        """Construct a Function module.
+
+        Parameters
+        ----------
+        input : module
+            the input module whose output should have the function applied to it
+        function : function
+            the function to apply to the input
+        """
+        self._input = input
+        self._function = function
+
+    def getData(self):
+        """Get output data from the module.
+
+        Returns
+        -------
+        output : NumPy array
+            an array containing the next block of output data
+        """
+        return self._function(self._input.getData())
 
 
 class String(object):
